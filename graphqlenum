@@ -1,0 +1,232 @@
+#!/bin/bash
+#===============================================================================
+# graphqlenum - GraphQL Path Enumeration & Security Auditor
+#===============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL="$SCRIPT_DIR/target/release/graphqlenum"
+DATA_DIR="$SCRIPT_DIR/data"
+
+SENSITIVE_KEYWORDS="User|Customer|Payment|Order|Address|Token|Password|CreditCard|Account|Admin|Email|Phone|Session|Receipt|Invoice|Shipping|Billing"
+
+echo -e "${GREEN}                            .__           .__                                "
+echo "   ________________  ______ |  |__   _____|  |   ____   ____  __ __  _____  "
+echo "  / ___\_  __ \__  \ \____ \|  |  \ / ____/  | _/ __ \ /    \|  |  \/     \ "
+echo " / /_/  >  | \// __ \|  |_> >   Y  < <_|  |  |_\  ___/|   |  \  |  /  Y Y  \ "
+echo " \___  /|__|  (____  /   __/|___|  /\__   |____/\___  >___|  /____/|__|_|  / "
+echo "/_____/            \/|__|        \/    |__|         \/     \/            \/ "
+echo -e "                            by ~/.manojxshrestha${NC}"
+echo ""
+
+log_info() { echo -e "${BLUE}[*]${NC} $1"; }
+log_success() { echo -e "${GREEN}[+]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+log_error() { echo -e "${RED}[-]${NC} $1"; }
+
+check_deps() {
+    command -v curl &>/dev/null || { log_error "curl required"; exit 1; }
+    command -v jq &>/dev/null || { log_error "jq required"; exit 1; }
+}
+
+dump_introspection() {
+    local endpoint="$1"
+    local output="$2"
+    
+    log_info "Fetching schema..."
+    
+    local query='{"query":"{ __schema { queryType { name } mutationType { name } types { kind name fields { name type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } }"}'
+    
+    local http_code=$(curl -s -o "$output" -w "%{http_code}" -X POST "$endpoint" \
+        -H "Content-Type: application/json" -d "$query")
+    
+    [ "$http_code" != "200" ] && { log_error "HTTP $http_code"; return 1; }
+    grep -q '"data"' "$output" || { log_error "Introspection failed"; return 1; }
+    
+    local count=$(jq -r '.data.__schema.types | length' "$output")
+    log_success "Got $count types"
+    return 0
+}
+
+get_filename() {
+    local endpoint="$1"
+    echo "$endpoint" | sed -E 's|^https?://||' | cut -d'/' -f1 | tr '.' '_' | head -c 50
+}
+
+list_sensitive() {
+    local schema="$1"
+    jq -r '.data.__schema.types[].name' "$schema" 2>/dev/null | grep -E "$SENSITIVE_KEYWORDS"
+}
+
+list_queries() {
+    local schema="$1"
+    jq -r '.data.__schema.types[] | select(.name == "Query" or .name == "QueryRoot") | .fields[].name' "$schema" 2>/dev/null
+}
+
+get_type_fields() {
+    local schema="$1"
+    local type_name="$2"
+    jq -r --arg t "$type_name" '.data.__schema.types[] | select(.name == $t) | .fields[] | .name' "$schema" 2>/dev/null
+}
+
+get_inner_type() {
+    local schema="$1"
+    local type_name="$2"
+    local field_name="$3"
+    jq -r ".data.__schema.types[] | select(.name == \"$type_name\") | .fields[] | select(.name == \"$field_name\") | .type | \
+        def f: if .kind == \"NON_NULL\" or .kind == \"LIST\" then .ofType | f else {kind: .kind, name: .name} end; f | \"\(.kind)|\(.name // \"\")\"" "$schema" 2>/dev/null
+}
+
+generate_query() {
+    local schema="$1"
+    local type_name="$2"
+    local depth="${3:-3}"
+    local seen="${4:-}"
+    
+    [ "$depth" -le 0 ] && { echo ""; return; }
+    [ -z "$type_name" ] || [ "$type_name" == "null" ] || [ "$type_name" == "UNKNOWN" ] && { echo ""; return; }
+    
+    local fields=$(get_type_fields "$schema" "$type_name")
+    [ -z "$fields" ] && { echo ""; return; }
+    
+    echo -n "{ "
+    for field in $fields; do
+        echo "$seen" | grep -qw "$field" && continue
+        local new_seen="$seen $field"
+        IFS='|' read -r kind obj_name <<< "$(get_inner_type "$schema" "$type_name" "$field")"
+        
+        if [ "$kind" == "SCALAR" ] || [ "$kind" == "ENUM" ]; then
+            echo -n "$field "
+        elif [ "$kind" == "OBJECT" ]; then
+            local sub=$(generate_query "$schema" "$obj_name" "$((depth-1))" "$new_seen")
+            [ -n "$sub" ] && echo -n "$field $sub " || echo -n "$field "
+        else
+            echo -n "$field "
+        fi
+    done
+    echo -n "} "
+}
+
+main() {
+    local url=""
+    local type=""
+    local mutations="false"
+    local data_field=""
+    local get_all="false"
+    local schema_file=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m) mutations="true"; shift;;
+            -d) data_field="$2"; shift 2;;
+            -a) get_all="true"; shift;;
+            -i) schema_file="$2"; shift 2;;
+            -h|--help) 
+                cat << 'EOF'
+Usage:
+  ./graphqlenum <url> [type] [-m]
+  ./graphqlenum <url> -d <field>
+  ./graphqlenum <url> -a
+  ./graphqlenum -i <schema.json> [type] [-m]
+
+Commands:
+  ./graphqlenum https://api.com/graphql           # List types
+  ./graphqlenum https://api.com/graphql User -m  # Find paths
+  ./graphqlenum https://api.com/graphql -d users  # Get field data
+  ./graphqlenum https://api.com/graphql -a       # Get ALL data
+  ./graphqlenum -i schema.json User -m           # Use saved schema
+
+Flags:
+  -m         Include mutations
+  -d <field> Get data from field
+  -a         Auto-retrieve ALL data
+  -i <file>  Use saved schema
+EOF
+                exit 0
+                ;;
+            *)
+                if [ -z "$url" ]; then
+                    url="$1"
+                elif [ -z "$type" ]; then
+                    type="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    check_deps
+    mkdir -p "$DATA_DIR"
+    
+    [ -z "$url" ] && [ -z "$schema_file" ] && { log_error "URL or -i <schema> required"; exit 1; }
+    
+    local schema=""
+    local name=""
+    
+    if [ -n "$schema_file" ]; then
+        [ ! -f "$schema_file" ] && { log_error "Schema not found: $schema_file"; exit 1; }
+        schema="$schema_file"
+        name=$(basename "$schema_file" .json)
+        [ "$get_all" == "true" ] || [ -n "$data_field" ] && { log_error "-a/-d require live URL"; exit 1; }
+    else
+        name=$(get_filename "$url")
+        schema=$(mktemp --suffix=.json)
+        trap "rm -f '$schema'" EXIT
+        dump_introspection "$url" "$schema" || exit 1
+    fi
+    
+    if [ "$get_all" == "true" ]; then
+        log_info "Retrieving ALL data..."
+        local queries=$(list_queries "$schema")
+        local count=$(echo "$queries" | wc -l)
+        local i=1
+        
+        for q in $queries; do
+            echo -ne "\r[*] [$i/$count] $q... "
+            local gql=$(generate_query "$schema" "$(jq -r --arg q "$q" '.data.__schema.types[] | select(.name == "Query" or .name == "QueryRoot") | .fields[] | select(.name == $q) | .type.name' "$schema" 2>/dev/null)" 3)
+            local resp=$(curl -s -X POST "$url" -H "Content-Type: application/json" -d "{\"query\":\"{ $q $gql }\"}")
+            echo "$resp" > "$DATA_DIR/${name}_${q}.json"
+            echo -e "\r[+] [$i/$count] $q saved"
+            i=$((i+1))
+        done
+        echo ""
+        log_success "All data saved to data/"
+        exit 0
+    fi
+    
+    if [ -n "$data_field" ]; then
+        log_info "Getting '$data_field'..."
+        local type_name=$(jq -r --arg q "$data_field" '.data.__schema.types[] | select(.name == "Query" or .name == "QueryRoot") | .fields[] | select(.name == $q) | .type.name' "$schema" 2>/dev/null)
+        [ -z "$type_name" ] || [ "$type_name" == "null" ] && type_name=$(get_inner_type "$schema" "QueryRoot" "$data_field" | cut -d'|' -f2)
+        local gql=$(generate_query "$schema" "$type_name" 10)
+        local resp=$(curl -s -X POST "$url" -H "Content-Type: application/json" -d "{\"query\":\"{ $data_field $gql }\"}")
+        echo "$resp" > "$DATA_DIR/${name}_${data_field}.json"
+        log_success "Saved to data/${name}_${data_field}.json"
+        echo "$resp" | jq '.' 2>/dev/null | head -20
+        exit 0
+    fi
+    
+    if [ -z "$type" ]; then
+        echo ""
+        log_info "Sensitive types:"
+        list_sensitive "$schema" | tee "$DATA_DIR/${name}_sensitive.txt" | nl -v 0
+        echo ""
+        log_info "Query fields:"
+        list_queries "$schema" | tee "$DATA_DIR/${name}_queries.txt" | nl -v 0
+        echo ""
+        log_success "Saved to data/"
+    else
+        [ ! -f "$TOOL" ] && { log_error "Rust tool required"; exit 1; }
+        local cmd="$TOOL -i '$schema' -t '$type'"
+        [ "$mutations" == "true" ] && cmd="$cmd --include-mutations"
+        eval "$cmd" 2>/dev/null | tee "$DATA_DIR/${name}_${type}_paths.txt"
+        log_success "Saved to data/${name}_${type}_paths.txt"
+    fi
+}
+
+main "$@"
